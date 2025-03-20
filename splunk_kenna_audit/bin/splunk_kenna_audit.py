@@ -1,12 +1,11 @@
 #!/usr/bin/env python
-import datetime
 import gzip
 import http.client
 import json
-import logging
 import os
 import sys
 import urllib.parse
+from datetime import datetime, timezone, timedelta
 
 # NOTE: splunklib must exist within github_forks/lib/splunklib for this
 # example to run! To run this locally use `SPLUNK_VERSION=latest docker compose up -d`
@@ -15,11 +14,13 @@ import urllib.parse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 
 from splunklib.modularinput import Argument, Event, EventWriter, Script, Scheme, ValidationDefinition, InputDefinition
+from splunklib.client import StoragePassword, Input
 
 
 class KennaAudit(Script):
     """Modular input class
     """
+    mask = "<moved to secure store>"
 
     def get_scheme(self):
         """When Splunk starts, it looks for all the modular inputs defined by
@@ -53,7 +54,7 @@ class KennaAudit(Script):
 
         scheme.add_argument(api_host)
 
-        api_key = Argument("api_key")
+        api_key = Argument("api_key")  # this key will be encrypted and masked
         api_key.title = "Kenna API Key"
         api_key.data_type = Argument.data_type_string
         api_key.description = "API Key that allows access to the Kenna API and audit log."
@@ -76,25 +77,25 @@ class KennaAudit(Script):
 
         :param validation_definition: a ValidationDefinition object
         """
-        # test if api URL is reachable
-        api_host = validation_definition.parameters["api_host"]
-        api_key = validation_definition.parameters["api_key"]
-        try:
-            connection = http.client.HTTPSConnection(api_host)
-            headers = {
-                'Content-type': 'application/json',
-                'User-Agent': 'splunk-sdk-python',
-                'X-Risk-Token': api_key,
-            }
-            connection.request("GET", "/connectors", headers=headers)
-            response = connection.getresponse()
-            body = response.read().decode()
-            data = json.loads(body)
-        except Exception as e:
-            raise ValueError(f"{e}")
-
-        if "message" in data:
-            raise ValueError(f"{data['message']}")
+        # TODO: test if api URL is reachable
+        # api_host = validation_definition.parameters["api_host"]
+        # api_key = validation_definition.parameters["api_key"]
+        # try:
+        #     connection = http.client.HTTPSConnection(api_host)
+        #     headers = {
+        #         'Content-type': 'application/json',
+        #         'User-Agent': 'splunk-sdk-python',
+        #         'X-Risk-Token': api_key,
+        #     }
+        #     connection.request("GET", "/connectors", headers=headers)
+        #     response = connection.getresponse()
+        #     body = response.read().decode()
+        #     data = json.loads(body)
+        # except Exception as e:
+        #     raise ValueError(f"{e}")
+        #
+        # if "message" in data:
+        #     raise ValueError(f"{data['message']}")
 
     def stream_events(self, inputs: InputDefinition, ew: EventWriter):
         """This function handles all the action: splunk calls this modular input
@@ -108,25 +109,32 @@ class KennaAudit(Script):
         :param inputs: an InputDefinition object
         :param ew: an EventWriter object
         """
-        logging.info("Starting stream events")
+        ew.log("INFO", "Starting app")
+
         # Go through each input for this modular input
-        for input_name, input_item in list(inputs.inputs.items()):
+        for input_key, input_value in inputs.inputs.items():
             # Get fields from the InputDefinition object
-            api_host = input_item["api_host"]
-            api_key = input_item["api_key"]
+            api_host = input_value["api_host"]
+            api_key = input_value["api_key"]
+            kind, input_name = input_key.split("://")
+            username = f"{kind}___{input_name}"  # convert stanza name to username
 
-            # Hint: API auth required?, get a secret from passwords.conf
-            # self.service.namespace["app"] = input_item["__app"]
-            # api_token = self.service.storage_passwords["github_api_token"].clear_password
+            ew.log("INFO", f"Processing {input_name=}")
 
-            day_ago = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+            # On first start API token is moved from webui input to splunk secure storage
+            # then input is replaced with masked value self.mask
+            self.secure_password(username, api_key, input_name)
+            clear_password = self.get_password(username)
+
+            # Kenna API require at last one full day ago
+            day_ago = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
 
             params = {"start_date": day_ago, "end_date": day_ago}
             query_string = urllib.parse.urlencode(params)
             headers = {
                 'Accept': 'application/gzip',
                 'User-Agent': 'splunk-sdk-python',
-                'X-Risk-Token': api_key,
+                'X-Risk-Token': clear_password,
             }
             url_path = f"/audit_logs?{query_string}"
             connection = http.client.HTTPSConnection(api_host)
@@ -141,17 +149,53 @@ class KennaAudit(Script):
                 # convert individual event to JSON
                 event_data = json.dumps(audit_event)
                 # parse time and convert it to epoch timestamp
-                event_time = datetime.datetime.strptime(
+                event_time = datetime.strptime(
                     audit_event['occurred_at'], '%Y-%m-%d %H:%M:%S UTC'
                 ).timestamp()
                 event = Event(
-                    stanza=input_name,
+                    stanza=input_key,
                     data=event_data,
-                    time=f"{event_time:.3f}"  # format to add 3 floating points
+                    time=f"{event_time:.3f}"  # format to add 3 digits after dot
                 )
-
                 # Tell the EventWriter to write this event
                 ew.write_event(event)
+                ew.log("INFO", f"Stop Processing {input_name=}")
+
+        ew.log("INFO", f"Finish app run")
+
+    def secure_password(self, username, password, input_name):
+        if password != self.mask:
+            self.encrypt_password(username, password)
+            self.mask_password('api_key', input_name)
+
+    def encrypt_password(self, username, password):
+        try:
+            # If the credential already exists, delete it.
+            storage_password: StoragePassword
+            for storage_password in self.service.storage_passwords:
+                if storage_password.username == username:
+                    self.service.storage_passwords.delete(username=storage_password.username)
+                    break
+
+            # Create the credential.
+            self.service.storage_passwords.create(password, username)
+
+        except Exception as e:
+            raise Exception(
+                f"An error occurred updating credentials. "
+                f"Please ensure your user account has admin_all_objects and/or "
+                f"list_storage_passwords capabilities.") from e
+
+    def mask_password(self, password_field, input_name):
+        kwargs = {password_field: self.mask}
+        item: Input = self.service.inputs[input_name]
+        item.update(**kwargs)
+
+    def get_password(self, username):
+        storage_password: StoragePassword
+        for storage_password in self.service.storage_passwords:
+            if storage_password.username == username:
+                return storage_password.clear_password
 
 
 if __name__ == "__main__":
