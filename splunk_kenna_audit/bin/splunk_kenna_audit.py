@@ -14,6 +14,7 @@ from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 
 from splunklib.modularinput import Argument, Event, EventWriter, Script, Scheme, ValidationDefinition, InputDefinition
+# noinspection PyProtectedMember
 from splunklib.client import StoragePassword, Input
 
 
@@ -64,9 +65,9 @@ class KennaAudit(Script):
         return scheme
 
     def validate_input(self, validation_definition: ValidationDefinition):
-        """In this example we are using external validation to verify that the Github
+        """In this example we are using external validation to verify that the GitHub
         repository exists. If validate_input does not raise an Exception, the input
-        is assumed to be valid. Otherwise it prints the exception as an error message
+        is assumed to be valid. Otherwise, it prints the exception as an error message
         when telling splunkd that the configuration is invalid.
 
         When using external validation, after splunkd calls the modular input with
