@@ -224,6 +224,7 @@ class KennaAudit(Script):
         while self._retries:
             try:
                 self.kv_store = self.service.kvstore[self.kv_name]
+                self.kv_store.data.query(query={}, limit=1)  # test that KV store is reachable
                 return True
             except HTTPError:
                 self._retries -= 1
