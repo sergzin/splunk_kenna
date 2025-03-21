@@ -1,0 +1,6 @@
+# This ensures only admins can read or write.
+# export = none prevents access from other apps via SPL queries like | inputlookup.
+
+[collections/splunk_kenna_audit]
+access = read : [ admin ], write : [ admin ]
+export = system

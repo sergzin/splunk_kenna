@@ -4,8 +4,10 @@ import http.client
 import json
 import os
 import sys
+import time
 import urllib.parse
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 # NOTE: splunklib must exist within github_forks/lib/splunklib for this
 # example to run! To run this locally use `SPLUNK_VERSION=latest docker compose up -d`
@@ -15,13 +17,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 
 from splunklib.modularinput import Argument, Event, EventWriter, Script, Scheme, ValidationDefinition, InputDefinition
 # noinspection PyProtectedMember
-from splunklib.client import StoragePassword, Input
-
+from splunklib.client import StoragePassword, Input, KVStoreCollection
+from splunklib.binding import HTTPError
 
 class KennaAudit(Script):
     """Modular input class
     """
     mask = "<moved to secure store>"
+    kv_name = "splunk_kenna_audit"  # used as kv collection store name
+
+    def __init__(self):
+        super().__init__()
+        self.kv_store: Optional[KVStoreCollection] = None
+        self._retries = 10  # total number ot tries to connect to KV store
+        self._timeout_kv = 10  # number of seconds to wait between retries
 
     def get_scheme(self):
         """When Splunk starts, it looks for all the modular inputs defined by
@@ -110,7 +119,10 @@ class KennaAudit(Script):
         :param inputs: an InputDefinition object
         :param ew: an EventWriter object
         """
-        ew.log("INFO", "Starting app")
+        ew.log("INFO", f"Starting app with {len(inputs.inputs)} inputs")
+        if not self.connected_to_kv():
+            ew.log("ERROR", f"App is not connected to a KVStore")
+            return
 
         # Go through each input for this modular input
         for input_key, input_value in inputs.inputs.items():
@@ -127,8 +139,16 @@ class KennaAudit(Script):
             self.secure_password(username, api_key, input_name)
             clear_password = self.get_password(username)
 
+            kv_value = self.get_kv(key=input_name)
+            last_run = kv_value.get("last_run")
+            last_ingested_date = kv_value.get("last_ingested_date")
+            ew.log("INFO", f"Last run was on {last_run} for date={last_ingested_date}")
+
             # Kenna API require at last one full day ago
             day_ago = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
+            if last_ingested_date and last_ingested_date == day_ago:
+                ew.log("INFO", f"Skipping {input_name=} since last run")
+                continue
 
             params = {"start_date": day_ago, "end_date": day_ago}
             query_string = urllib.parse.urlencode(params)
@@ -144,6 +164,7 @@ class KennaAudit(Script):
             body = response.read()
             text = gzip.decompress(body)
 
+            counter = 0
             for item in text.splitlines():
                 # remove audit_log_event from events, all data is inside
                 audit_event = json.loads(item).pop("audit_log_event")
@@ -154,14 +175,15 @@ class KennaAudit(Script):
                     audit_event['occurred_at'], '%Y-%m-%d %H:%M:%S UTC'
                 ).timestamp()
                 event = Event(
-                    stanza=input_key,
+                    stanza=input_name,
                     data=event_data,
                     time=f"{event_time:.3f}"  # format to add 3 digits after dot
                 )
                 # Tell the EventWriter to write this event
                 ew.write_event(event)
-                ew.log("INFO", f"Stop Processing {input_name=}")
-
+                counter += 1
+                self.upsert_kv(input_name, last_run=datetime.now(timezone.utc).isoformat(), last_ingested_date=day_ago)
+            ew.log("INFO", f"Stop Processing {input_name=}. Processed {counter} events.")
         ew.log("INFO", f"Finish app run")
 
     def secure_password(self, username, password, input_name):
@@ -197,6 +219,30 @@ class KennaAudit(Script):
         for storage_password in self.service.storage_passwords:
             if storage_password.username == username:
                 return storage_password.clear_password
+
+    def connected_to_kv(self):
+        while self._retries:
+            try:
+                self.kv_store = self.service.kvstore[self.kv_name]
+                return True
+            except HTTPError:
+                self._retries -= 1
+                time.sleep(self._timeout_kv)
+                continue
+        return False
+
+    def upsert_kv(self, key: str, **kwargs):
+        if not self.get_kv(key):
+            self.kv_store.data.insert(data=json.dumps({"_key": key, **kwargs}))
+        else:
+            self.kv_store.data.update(id=key, data=json.dumps(kwargs))
+
+    def get_kv(self, key: str) -> dict:
+        # noinspection PyTypeChecker
+        values: list = self.kv_store.data.query(query={"_key": key})
+        if values:
+            return values[0]
+        return dict()
 
 
 if __name__ == "__main__":
