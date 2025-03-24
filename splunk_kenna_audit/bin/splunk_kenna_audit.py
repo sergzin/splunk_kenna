@@ -175,7 +175,7 @@ class KennaAudit(Script):
                     audit_event['occurred_at'], '%Y-%m-%d %H:%M:%S UTC'
                 ).timestamp()
                 event = Event(
-                    stanza=input_name,
+                    stanza=input_key,
                     data=event_data,
                     time=f"{event_time:.3f}"  # format to add 3 digits after dot
                 )
