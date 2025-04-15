@@ -1,3 +1,8 @@
+# allow everyone to access app, only admins can change settings.
+[]
+access = read : [ * ], write : [ admin, power ]
+
+
 # This ensures only admins can read or write.
 # export = none prevents access from other apps via SPL queries like | inputlookup.
 
